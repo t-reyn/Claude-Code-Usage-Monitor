@@ -230,7 +230,7 @@ impl Default for SettingsFile {
 }
 
 fn default_poll_interval() -> u32 {
-    POLL_15_MIN
+    POLL_5_MIN
 }
 
 fn default_widget_visible() -> bool {
@@ -1091,13 +1091,13 @@ pub fn run() {
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
 
-        // Poll timer: 15 minutes
+        // Poll timer: 5 minutes by default
         let initial_poll_ms = {
             let state = lock_state();
             state
                 .as_ref()
                 .map(|s| s.poll_interval_ms)
-                .unwrap_or(POLL_15_MIN)
+                .unwrap_or(POLL_5_MIN)
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
 
@@ -2342,7 +2342,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_codex,
                 ),
                 None => (
-                    POLL_15_MIN,
+                    POLL_5_MIN,
                     LanguageId::English.strings(),
                     LanguageId::English,
                     None,

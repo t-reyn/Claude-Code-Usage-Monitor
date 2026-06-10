@@ -44,4 +44,4 @@ DPI: every pixel value must go through `sc()` (96-DPI base). GDI constraints: so
 
 ## Settings
 
-`%APPDATA%\ClaudeCodeUsageMonitor\settings.json` — poll interval (default 15 min), `show_claude_code` (default true), `show_codex` (default **false**), tray offset, widget visibility, language. Right-click widget/tray for the menu (poll frequency, Start with Windows, model toggles, reset position).
+`%APPDATA%\ClaudeCodeUsageMonitor\settings.json` — poll interval (default 5 min; menu offers 1/5/15 min + 1 hr), `show_claude_code` (default true), `show_codex` (default **false**), tray offset, widget visibility, language. Right-click widget/tray for the menu (poll frequency, Start with Windows, model toggles, reset position). Note: usage % only refreshes on poll; the countdown text re-renders every minute from the last-fetched reset time.
