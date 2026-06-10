@@ -1058,7 +1058,11 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
     let total_days = total_secs / 86400;
 
     if total_days >= 1 {
-        format!("{total_days}{}", strings.day_suffix)
+        let hours = (total_secs % 86400) / 3600;
+        format!(
+            "{total_days}{} {hours}{}",
+            strings.day_suffix, strings.hour_suffix
+        )
     } else if total_hours >= 1 {
         let minutes = (total_secs % 3600) / 60;
         format!(
@@ -1073,13 +1077,15 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
 }
 
 fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
+    let total_hours = total_secs / 3600;
     let total_mins = total_secs / 60;
     let total_days = total_secs / 86400;
 
-    // Within a day the display shows hours+minutes, so the text changes every
-    // minute — align the refresh to the next minute boundary, not the next hour.
+    // The display shows days+hours above a day and hours+minutes below one, so
+    // the text changes every hour (days range) or every minute (hours range).
+    // Align the refresh to that boundary rather than the next day/hour.
     let current_bucket_start = if total_days >= 1 {
-        total_days * 86400
+        total_hours * 3600
     } else if total_mins >= 1 {
         total_mins * 60
     } else {
