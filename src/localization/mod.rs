@@ -4,6 +4,8 @@ mod french;
 mod german;
 mod japanese;
 mod korean;
+mod portuguese_brazil;
+mod russian;
 mod spanish;
 mod traditional_chinese;
 
@@ -23,10 +25,12 @@ pub enum LanguageId {
     Japanese,
     Korean,
     TraditionalChinese,
+    Russian,
+    PortugueseBrazil,
 }
 
 impl LanguageId {
-    pub const ALL: [LanguageId; 8] = [
+    pub const ALL: [LanguageId; 10] = [
         LanguageId::English,
         LanguageId::Dutch,
         LanguageId::Spanish,
@@ -35,6 +39,8 @@ impl LanguageId {
         LanguageId::Japanese,
         LanguageId::Korean,
         LanguageId::TraditionalChinese,
+        LanguageId::Russian,
+        LanguageId::PortugueseBrazil,
     ];
 
     pub fn code(self) -> &'static str {
@@ -47,6 +53,8 @@ impl LanguageId {
             Self::Japanese => "ja",
             Self::Korean => "ko",
             Self::TraditionalChinese => "zh-TW",
+            Self::Russian => "ru",
+            Self::PortugueseBrazil => "pt-BR",
         }
     }
 
@@ -60,6 +68,8 @@ impl LanguageId {
             Self::Japanese => "日本語",
             Self::Korean => "한국어",
             Self::TraditionalChinese => "繁體中文",
+            Self::Russian => "Русский",
+            Self::PortugueseBrazil => "Português (Brasil)",
         }
     }
 
@@ -73,6 +83,8 @@ impl LanguageId {
             Self::Japanese => japanese::STRINGS,
             Self::Korean => korean::STRINGS,
             Self::TraditionalChinese => traditional_chinese::STRINGS,
+            Self::Russian => russian::STRINGS,
+            Self::PortugueseBrazil => portuguese_brazil::STRINGS,
         }
     }
 
@@ -86,6 +98,8 @@ impl LanguageId {
             Self::Japanese => japanese::UPDATE_VIA_WINGET_LABEL,
             Self::Korean => korean::UPDATE_VIA_WINGET_LABEL,
             Self::TraditionalChinese => traditional_chinese::UPDATE_VIA_WINGET_LABEL,
+            Self::Russian => russian::UPDATE_VIA_WINGET_LABEL,
+            Self::PortugueseBrazil => portuguese_brazil::UPDATE_VIA_WINGET_LABEL,
         }
     }
 
@@ -114,6 +128,8 @@ impl LanguageId {
                     None
                 }
             }
+            "ru" => Some(Self::Russian),
+            "pt" => Some(Self::PortugueseBrazil),
             _ => None,
         }
     }
@@ -131,6 +147,7 @@ pub struct Strings {
     pub models: &'static str,
     pub claude_code_model: &'static str,
     pub codex_model: &'static str,
+    pub antigravity_model: &'static str,
     pub settings: &'static str,
     pub start_with_windows: &'static str,
     pub reset_position: &'static str,
@@ -160,7 +177,10 @@ pub struct Strings {
     pub token_expired_body: &'static str,
     pub codex_token_expired_title: &'static str,
     pub codex_token_expired_body: &'static str,
+    pub antigravity_token_expired_title: &'static str,
+    pub antigravity_token_expired_body: &'static str,
     pub codex_window_title: &'static str,
+    pub antigravity_window_title: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {
