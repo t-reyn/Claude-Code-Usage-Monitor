@@ -1,6 +1,15 @@
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
-use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, RPC_E_CHANGED_MODE};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+};
+use windows::Win32::UI::Accessibility::{
+    SetWinEventHook, UnhookWinEvent, CUIAutomation, HWINEVENTHOOK, IUIAutomation,
+    TreeScope_Descendants,
+};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -99,6 +108,108 @@ pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
             return None;
         }
         Some(abd.rc)
+    }
+}
+
+/// AutomationId shared by every element in the Windows 11 system tray — clock,
+/// network, volume, "show hidden icons". Stable across UI languages, unlike the
+/// element names.
+const TRAY_ELEMENT_AUTOMATION_ID: &str = "SystemTrayIcon";
+
+/// Left edge of the leftmost system-tray element on `taskbar_hwnd`, in physical
+/// pixels, resolved through UI Automation.
+///
+/// Windows 11 secondary taskbars have no legacy `TrayNotifyWnd`: their clock is
+/// drawn by a XAML island whose elements own no HWNDs, so window enumeration
+/// cannot see it and only UI Automation can report where it starts.
+///
+/// **Call this only from a dedicated background thread.** Our own widget is a
+/// child of the taskbar, so the tree walk queries our window over WM_GETOBJECT;
+/// running it on the UI thread deadlocks that request against ourselves until COM
+/// gives up (measured: ~10.5s). This function parks its thread in the MTA, which
+/// needs no message pump of its own.
+pub fn tray_content_left_via_uia(taskbar_hwnd: HWND) -> Option<i32> {
+    unsafe {
+        // RPC_E_CHANGED_MODE means the thread already belongs to another
+        // apartment and we must not balance it with CoUninitialize; S_OK/S_FALSE
+        // both take a reference that we own.
+        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+            return None;
+        }
+        let owns_com = hr.is_ok();
+
+        // Scoped so every COM interface is released before CoUninitialize.
+        let leftmost = (|| {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            let root = automation.ElementFromHandle(taskbar_hwnd).ok()?;
+            let condition = automation.CreateTrueCondition().ok()?;
+            let elements = root.FindAll(TreeScope_Descendants, &condition).ok()?;
+            let count = elements.Length().ok()?;
+
+            let mut leftmost: Option<i32> = None;
+            for index in 0..count {
+                let Ok(element) = elements.GetElement(index) else {
+                    continue;
+                };
+                let is_tray_element = element
+                    .CurrentAutomationId()
+                    .map(|id| id.to_string() == TRAY_ELEMENT_AUTOMATION_ID)
+                    .unwrap_or(false);
+                if !is_tray_element {
+                    continue;
+                }
+                let Ok(rect) = element.CurrentBoundingRectangle() else {
+                    continue;
+                };
+                // Collapsed elements report an empty rect at the origin; anchoring
+                // to one would throw the widget across the screen.
+                if rect.right <= rect.left {
+                    continue;
+                }
+                leftmost = Some(leftmost.map_or(rect.left, |left: i32| left.min(rect.left)));
+            }
+            leftmost
+        })();
+
+        if owns_com {
+            CoUninitialize();
+        }
+        leftmost
+    }
+}
+
+/// Display-device name (e.g. `\\.\DISPLAY1`) of the monitor `hwnd` sits on.
+///
+/// Used to remember which taskbar the widget is pinned to. Survives the display
+/// re-arrangements that reshuffle taskbar enumeration order, which a bare index
+/// cannot.
+pub fn monitor_device_name(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            return None;
+        }
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // GetMonitorInfoW reads cbSize to learn this is the EX struct and fills
+        // szDevice past the base struct; monitorInfo is the first field so its
+        // address is the start of the whole record.
+        if !GetMonitorInfoW(monitor, &mut info.monitorInfo as *mut MONITORINFO).as_bool() {
+            return None;
+        }
+        let end = info
+            .szDevice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szDevice.len());
+        Some(String::from_utf16_lossy(&info.szDevice[..end]))
     }
 }
 

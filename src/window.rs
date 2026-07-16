@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -84,11 +84,24 @@ struct AppState {
     last_update_check_unix: Option<u64>,
 
     taskbar_index: usize,
+    /// Display-device name of the monitor the widget is attached to; see the
+    /// matching field on `SettingsFile`.
+    taskbar_monitor: Option<String>,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
     drag_start_client_x: i32,
     drag_start_offset: i32,
+    /// Tray edge resolved once when the drag starts. It cannot move mid-drag, and
+    /// resolving it needs the state lock this window procedure already holds while
+    /// handling each mouse-move.
+    drag_tray_left: Option<i32>,
+    /// A cross-taskbar drop awaiting its target's true tray edge: (taskbar-hwnd
+    /// key, intended widget-left in taskbar-relative px). On a taskbar with no
+    /// TrayNotifyWnd the edge only arrives from the async probe, so the offset is
+    /// re-derived from the drop point once it lands — otherwise it would be
+    /// computed against the fallback screen edge and land ~112px off.
+    pending_drop: Option<(isize, i32)>,
 
     widget_visible: bool,
 }
@@ -134,6 +147,8 @@ const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+/// Posted by the background UI Automation probe once it has resolved a tray edge.
+const WM_APP_TRAY_LEFT_RESOLVED: u32 = WM_APP + 4;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -302,6 +317,11 @@ struct SettingsFile {
     tray_offset: i32,
     #[serde(default)]
     taskbar_index: usize,
+    /// Display-device name of the taskbar's monitor. Preferred over `taskbar_index`
+    /// so the widget stays on the same physical monitor when a display change
+    /// reshuffles taskbar order. Absent in pre-existing settings files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taskbar_monitor: Option<String>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -323,6 +343,7 @@ impl Default for SettingsFile {
         Self {
             tray_offset: 0,
             taskbar_index: 0,
+            taskbar_monitor: None,
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
@@ -382,6 +403,7 @@ fn save_state_settings() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
+            taskbar_monitor: s.taskbar_monitor.clone(),
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
@@ -503,8 +525,9 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
 
     let index = requested_index.min(taskbars.len().saturating_sub(1));
     let taskbar = taskbars[index];
+    let monitor = native_interop::monitor_device_name(taskbar.hwnd);
     diagnose::log(format!(
-        "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
+        "taskbar selected index={index} count={} hwnd={:?} monitor={monitor:?} rect=({}, {}, {}, {})",
         taskbars.len(),
         taskbar.hwnd,
         taskbar.rect.left,
@@ -546,9 +569,36 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
         s.taskbar_index = index;
+        // Remember the monitor so a later display re-sort still finds this taskbar.
+        // Auto-migrates pre-existing index-only settings on first attach.
+        if monitor.is_some() {
+            s.taskbar_monitor = monitor;
+        }
         s.embedded = true;
     }
     true
+}
+
+/// Choose which taskbar to attach to: the one on the saved monitor if it is still
+/// present, otherwise the saved index (clamped). Falls back to the index whenever
+/// the monitor is unknown or gone — e.g. that display was disconnected.
+fn resolve_taskbar_index(saved_monitor: Option<&str>, saved_index: usize) -> usize {
+    let taskbars = native_interop::find_taskbars();
+    if taskbars.is_empty() {
+        return saved_index;
+    }
+    if let Some(name) = saved_monitor {
+        if let Some(index) = taskbars
+            .iter()
+            .position(|taskbar| native_interop::monitor_device_name(taskbar.hwnd).as_deref() == Some(name))
+        {
+            return index;
+        }
+        diagnose::log(format!(
+            "saved taskbar monitor {name:?} not present; falling back to index {saved_index}"
+        ));
+    }
+    saved_index.min(taskbars.len() - 1)
 }
 
 fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
@@ -563,14 +613,127 @@ fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)>
         })
 }
 
+/// How old a good probed tray edge may get before a background refresh is kicked
+/// off. The clock changes width as its text does (e.g. 9:59 -> 10:00), so the edge
+/// is re-resolved rather than trusted forever.
+const TRAY_LEFT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// Shorter retry cadence while we have no usable edge yet (probe still failing),
+/// so a transient failure heals in seconds rather than a full refresh interval.
+const TRAY_LEFT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// (taskbar hwnd, resolved edge, when it was resolved). The inner `Option` records
+/// failures too, so a taskbar with no discoverable tray is not re-probed in a loop.
+static TRAY_LEFT_CACHE: Mutex<Option<(isize, Option<i32>, Instant)>> = Mutex::new(None);
+static UIA_PROBE_INFLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Resolve the tray edge on a background thread and post the result back. Never
+/// blocks the caller: the UI thread must stay responsive while the probe runs, or
+/// the tree walk's WM_GETOBJECT to our own window has nobody to answer it.
+fn request_uia_tray_probe(taskbar_hwnd: HWND, taskbar_rect: RECT) {
+    if UIA_PROBE_INFLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let main_hwnd = {
+        let state = lock_state();
+        state.as_ref().map(|s| s.hwnd)
+    };
+    let Some(main_hwnd) = main_hwnd else {
+        UIA_PROBE_INFLIGHT.store(false, Ordering::Release);
+        return;
+    };
+
+    let taskbar = SendHwnd::from_hwnd(taskbar_hwnd);
+    let (taskbar_left, taskbar_right) = (taskbar_rect.left, taskbar_rect.right);
+
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        // Ignore an edge outside this taskbar: UI Automation reports desktop-wide
+        // coordinates and could hand back an element from another monitor.
+        let tray_left = native_interop::tray_content_left_via_uia(taskbar.to_hwnd())
+            .filter(|left| *left > taskbar_left && *left <= taskbar_right);
+        diagnose::log(format!(
+            "uia tray probe took {}ms -> {tray_left:?}",
+            started.elapsed().as_millis()
+        ));
+
+        {
+            let mut cache = TRAY_LEFT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            // A failed probe (None) must not clobber a good edge for this taskbar:
+            // that would re-anchor the widget under the clock until the next
+            // successful refresh. Keep the prior value and just let the retry
+            // cadence try again.
+            let previous = cache.and_then(|(key, left, _)| (key == taskbar.0).then_some(left).flatten());
+            *cache = Some((taskbar.0, tray_left.or(previous), Instant::now()));
+        }
+        UIA_PROBE_INFLIGHT.store(false, Ordering::Release);
+
+        unsafe {
+            let _ = PostMessageW(
+                main_hwnd.to_hwnd(),
+                WM_APP_TRAY_LEFT_RESOLVED,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    });
+}
+
+/// X coordinate the widget's right edge anchors to: the start of the taskbar's
+/// clock/tray cluster.
+///
+/// Must not be called with the app-state lock held; the probe it may start takes
+/// that lock.
 fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
-    let mut tray_left = taskbar_rect.right;
     if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
         if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
+            return tray_rect.left;
         }
     }
-    tray_left
+
+    // Windows 11 secondary taskbars have no TrayNotifyWnd. Falling straight
+    // through to taskbar_rect.right would anchor the widget to the screen edge,
+    // underneath the clock that is still drawn there.
+    let key = taskbar_hwnd.0 as isize;
+    let cached = {
+        let cache = TRAY_LEFT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.filter(|(cached_key, _, _)| *cached_key == key)
+    };
+
+    match cached {
+        // Known good edge: keep using it even once stale — dropping back to the
+        // taskbar edge while a refresh runs would make the widget jump — and kick
+        // a lazy refresh in case the clock changed width.
+        Some((_, Some(tray_left), resolved_at)) => {
+            if resolved_at.elapsed() >= TRAY_LEFT_REFRESH_INTERVAL {
+                request_uia_tray_probe(taskbar_hwnd, taskbar_rect);
+            }
+            tray_left
+        }
+        // Probed but no usable edge yet: retry sooner than the refresh interval.
+        Some((_, None, resolved_at)) => {
+            if resolved_at.elapsed() >= TRAY_LEFT_RETRY_INTERVAL {
+                request_uia_tray_probe(taskbar_hwnd, taskbar_rect);
+            }
+            taskbar_rect.right
+        }
+        None => {
+            request_uia_tray_probe(taskbar_hwnd, taskbar_rect);
+            taskbar_rect.right
+        }
+    }
+}
+
+/// Whether the widget's true anchor edge for `taskbar_hwnd` is known right now
+/// (a legacy TrayNotifyWnd exists, or the async probe has cached a real edge) as
+/// opposed to only the fallback screen edge being available.
+fn tray_edge_is_known(taskbar_hwnd: HWND) -> bool {
+    if native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd").is_some() {
+        return true;
+    }
+    let key = taskbar_hwnd.0 as isize;
+    let cache = TRAY_LEFT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    matches!(*cache, Some((cached_key, Some(_), _)) if cached_key == key)
 }
 
 fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
@@ -589,6 +752,93 @@ fn offset_for_drop_point(
     let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
     let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
     clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
+}
+
+/// Once a dropped-onto taskbar's true tray edge is known, re-derive `tray_offset`
+/// from the recorded drop point so the widget settles exactly where it was
+/// dropped. No-op unless a `pending_drop` is waiting for the currently attached
+/// taskbar and its edge has resolved.
+fn finalize_pending_drop() {
+    let (taskbar_hwnd, pending_key, desired_left) = {
+        let state = lock_state();
+        match state.as_ref() {
+            // Don't fight an in-progress drag; a new drag will resolve placement.
+            Some(s) if !s.dragging => match (s.taskbar_hwnd, s.pending_drop) {
+                (Some(taskbar_hwnd), Some((key, desired_left))) => {
+                    (taskbar_hwnd, key, desired_left)
+                }
+                _ => return,
+            },
+            _ => return,
+        }
+    };
+
+    // The attached taskbar changed since the drop; the pending drop is stale.
+    if taskbar_hwnd.0 as isize != pending_key {
+        clear_pending_drop();
+        return;
+    }
+    // Wait for the real edge; the probe reposts this message when it lands.
+    if !tray_edge_is_known(taskbar_hwnd) {
+        return;
+    }
+    let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) else {
+        return;
+    };
+
+    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
+    let offset = clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset);
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.tray_offset = offset;
+            s.pending_drop = None;
+        }
+    }
+    save_state_settings();
+}
+
+fn clear_pending_drop() {
+    let mut state = lock_state();
+    if let Some(s) = state.as_mut() {
+        s.pending_drop = None;
+    }
+}
+
+/// After any drag release, keep `pending_drop` pointed at the widget's CURRENT
+/// intended position on the attached taskbar. If that taskbar's true tray edge is
+/// still unknown, record where the widget sits now so `finalize_pending_drop`
+/// re-derives the offset for THIS placement once the async probe lands; otherwise
+/// clear any stale pending drop so an earlier cross-drop can't revert a later
+/// same-taskbar nudge.
+fn reconcile_pending_drop_after_drag() {
+    let (taskbar_hwnd, tray_offset) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => (s.taskbar_hwnd, s.tray_offset),
+            None => return,
+        }
+    };
+    let Some(taskbar_hwnd) = taskbar_hwnd else {
+        clear_pending_drop();
+        return;
+    };
+    if tray_edge_is_known(taskbar_hwnd) {
+        clear_pending_drop();
+        return;
+    }
+    let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) else {
+        return;
+    };
+    // Edge unknown, so tray_left is the fallback the widget is currently drawn
+    // against; this yields its present taskbar-relative left (post-clamp).
+    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+    let desired_left = tray_left - taskbar_rect.left - total_widget_width() - tray_offset;
+    let mut state = lock_state();
+    if let Some(s) = state.as_mut() {
+        s.pending_drop = Some((taskbar_hwnd.0 as isize, desired_left));
+    }
 }
 
 fn now_unix_secs() -> u64 {
@@ -1321,18 +1571,27 @@ pub fn run() {
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
+                taskbar_monitor: settings.taskbar_monitor.clone(),
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
+                drag_tray_left: None,
+                pending_drop: None,
                 widget_visible: settings.widget_visible,
             });
         }
 
-        // Try to embed in taskbar
-        if attach_to_taskbar(hwnd, settings.taskbar_index) {
+        // Try to embed in taskbar, preferring the saved monitor over its index.
+        let start_index =
+            resolve_taskbar_index(settings.taskbar_monitor.as_deref(), settings.taskbar_index);
+        if attach_to_taskbar(hwnd, start_index) {
             embedded = true;
+            // Persist the monitor name the attach just recorded so the pin
+            // survives a restart even if the user never touches the widget again
+            // (this is what migrates an index-only settings file).
+            save_state_settings();
         }
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
@@ -2096,15 +2355,9 @@ fn position_at_taskbar() {
     };
 
     let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-    let mut tray_left = taskbar_rect.right;
     let anchor_top = taskbar_rect.top;
     let anchor_height = taskbar_height;
-
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
+    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
 
     let widget_width = total_widget_width();
     let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
@@ -2283,6 +2536,10 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
+                    // Taskbars without a TrayNotifyWnd get no tray-location hook,
+                    // so this is the only thing that re-anchors the widget when the
+                    // clock changes width (9:59 -> 10:00).
+                    position_at_taskbar();
                     render_layered();
                     schedule_countdown_timer();
                 }
@@ -2319,6 +2576,12 @@ unsafe extern "system" fn wnd_proc(
             sync_tray_icons(hwnd);
             LRESULT(0)
         }
+        WM_APP_TRAY_LEFT_RESOLVED => {
+            finalize_pending_drop();
+            position_at_taskbar();
+            render_layered();
+            LRESULT(0)
+        }
         WM_APP_UPDATE_CHECK_COMPLETE => {
             schedule_auto_update_check(hwnd);
             LRESULT(0)
@@ -2349,12 +2612,25 @@ unsafe extern "system" fn wnd_proc(
 
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
+
+            // Resolve the tray edge before taking the lock, since resolving it
+            // takes that same lock.
+            let taskbar_hwnd = {
+                let state = lock_state();
+                state.as_ref().and_then(|s| s.taskbar_hwnd)
+            };
+            let drag_tray_left = taskbar_hwnd.and_then(|taskbar_hwnd| {
+                native_interop::get_taskbar_rect(taskbar_hwnd)
+                    .map(|taskbar_rect| tray_left_for_taskbar(taskbar_hwnd, taskbar_rect))
+            });
+
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 s.dragging = true;
                 s.drag_start_mouse_x = pt.x;
                 s.drag_start_client_x = client_x;
                 s.drag_start_offset = s.tray_offset;
+                s.drag_tray_left = drag_tray_left;
             }
             SetCapture(hwnd);
             LRESULT(0)
@@ -2390,16 +2666,7 @@ unsafe extern "system" fn wnd_proc(
                     // Clamp: don't go past left edge of taskbar
                     if let Some(taskbar_hwnd) = taskbar_hwnd {
                         if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                            let mut tray_left = taskbar_rect.right;
-                            if let Some(tray_hwnd) =
-                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                            {
-                                if let Some(tray_rect) =
-                                    native_interop::get_window_rect_safe(tray_hwnd)
-                                {
-                                    tray_left = tray_rect.left;
-                                }
-                            }
+                            let tray_left = s.drag_tray_left.unwrap_or(taskbar_rect.right);
                             let widget_width = total_widget_width_for_state(s);
                             let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
                             if new_offset > max_offset {
@@ -2475,6 +2742,10 @@ unsafe extern "system" fn wnd_proc(
                 let _ = ReleaseCapture();
                 if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
                     if target_index != current_taskbar_index {
+                        // Provisional offset from whatever edge we know now; the
+                        // final position is reconciled below once attached. On a
+                        // taskbar with no TrayNotifyWnd the true edge only arrives
+                        // from the async probe.
                         let new_offset = offset_for_drop_point(
                             target_taskbar.hwnd,
                             target_taskbar.rect,
@@ -2493,6 +2764,11 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                 }
+                // Point pending_drop at THIS release's position (or clear it once
+                // the edge is known), covering same-taskbar re-nudges as well as
+                // cross-drops — otherwise a later nudge could be reverted to an
+                // earlier drop point when the probe lands.
+                reconcile_pending_drop_after_drag();
                 save_state_settings();
             }
             LRESULT(0)
