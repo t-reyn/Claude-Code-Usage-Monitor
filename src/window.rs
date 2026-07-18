@@ -20,8 +20,8 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_MONITOR_RECHECK, TIMER_POLL, TIMER_RESET_POLL,
+    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::theme;
@@ -516,7 +516,7 @@ fn toggle_widget_visibility(hwnd: HWND) {
     }
 }
 
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
+fn attach_to_taskbar(hwnd: HWND, requested_index: usize, update_pin: bool) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
         diagnose::log("taskbar not found; using fallback popup window");
@@ -553,10 +553,15 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         diagnose::log("TrayNotifyWnd not found");
     }
 
-    let hook = tray_notify.and_then(|tray_hwnd| {
-        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
-    });
+    // Hook the taskbar's own thread (TrayNotifyWnd, when present, lives on the
+    // same one): besides tray moves, the callback watches the taskbar window
+    // itself so a cross-monitor reshuffle is noticed immediately.
+    let taskbar_thread_id = native_interop::get_window_thread_id(taskbar.hwnd);
+    let hook = if taskbar_thread_id != 0 {
+        native_interop::set_tray_event_hook(taskbar_thread_id, on_tray_location_changed)
+    } else {
+        None
+    };
     if hook.is_some() {
         diagnose::log("tray event hook installed");
     } else {
@@ -569,9 +574,12 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
         s.taskbar_index = index;
-        // Remember the monitor so a later display re-sort still finds this taskbar.
-        // Auto-migrates pre-existing index-only settings on first attach.
-        if monitor.is_some() {
+        // The pin only moves on an intentional attach (a user drop onto another
+        // taskbar) or first-run migration of an index-only settings file.
+        // Automatic attaches (startup, recovery) keep the existing pin, so an
+        // index fallback landing on the wrong monitor stays temporary and
+        // self-heals instead of re-pinning the widget to the wrong display.
+        if monitor.is_some() && (update_pin || s.taskbar_monitor.is_none()) {
             s.taskbar_monitor = monitor;
         }
         s.embedded = true;
@@ -599,6 +607,73 @@ fn resolve_taskbar_index(saved_monitor: Option<&str>, saved_index: usize) -> usi
         ));
     }
     saved_index.min(taskbars.len() - 1)
+}
+
+/// Retry cadence for snapping the widget back to its pinned monitor while a
+/// mismatch persists (pinned display absent, or the shell still reshuffling
+/// taskbars after a display change).
+const MONITOR_RECHECK_MS: u32 = 3_000;
+
+/// True when the widget is pinned to a monitor but its taskbar currently sits on
+/// a different one — the parent was reshuffled by a display change, or an attach
+/// fell back to another taskbar while the pinned display was absent.
+fn monitor_pin_mismatch() -> bool {
+    let (pinned, taskbar_hwnd) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => (s.taskbar_monitor.clone(), s.taskbar_hwnd),
+            None => return false,
+        }
+    };
+    let (Some(pinned), Some(taskbar_hwnd)) = (pinned, taskbar_hwnd) else {
+        return false;
+    };
+    native_interop::monitor_device_name(taskbar_hwnd).as_deref() != Some(pinned.as_str())
+}
+
+/// Re-attach to the taskbar on the pinned monitor if the widget has drifted off
+/// it. Returns false only while a mismatch persists (the pinned display's
+/// taskbar is missing, or the attach failed) so callers can schedule a retry.
+fn ensure_on_pinned_monitor(hwnd: HWND) -> bool {
+    let (pinned, dragging, pending_drop) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => (
+                s.taskbar_monitor.clone(),
+                s.dragging,
+                s.pending_drop.is_some(),
+            ),
+            None => return true,
+        }
+    };
+    // Never yank the widget out from under an in-flight drag or drop.
+    if dragging || pending_drop {
+        return true;
+    }
+    let Some(pinned) = pinned else { return true };
+    if !monitor_pin_mismatch() {
+        return true;
+    }
+
+    let target_index = native_interop::find_taskbars().iter().position(|taskbar| {
+        native_interop::monitor_device_name(taskbar.hwnd).as_deref() == Some(pinned.as_str())
+    });
+    let Some(target_index) = target_index else {
+        // Pinned display currently absent (asleep / detached): keep the pin and
+        // stay where we are until it comes back.
+        return false;
+    };
+
+    diagnose::log(format!(
+        "widget drifted off pinned monitor {pinned:?}; re-attaching to taskbar index {target_index}"
+    ));
+    if !attach_to_taskbar(hwnd, target_index, false) {
+        return false;
+    }
+    position_at_taskbar();
+    render_layered();
+    save_state_settings();
+    true
 }
 
 fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
@@ -1586,12 +1661,19 @@ pub fn run() {
         // Try to embed in taskbar, preferring the saved monitor over its index.
         let start_index =
             resolve_taskbar_index(settings.taskbar_monitor.as_deref(), settings.taskbar_index);
-        if attach_to_taskbar(hwnd, start_index) {
+        if attach_to_taskbar(hwnd, start_index, false) {
             embedded = true;
             // Persist the monitor name the attach just recorded so the pin
             // survives a restart even if the user never touches the widget again
             // (this is what migrates an index-only settings file).
             save_state_settings();
+            // A relaunch during a display transition (e.g. wake-from-sleep after
+            // an explorer restart) can land on the wrong taskbar while the pinned
+            // monitor is momentarily unenumerable; keep rechecking until the
+            // widget is back on its pinned monitor.
+            if monitor_pin_mismatch() {
+                SetTimer(hwnd, TIMER_MONITOR_RECHECK, MONITOR_RECHECK_MS, None);
+            }
         }
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
@@ -2415,15 +2497,48 @@ unsafe extern "system" fn on_tray_location_changed(
     _time: u32,
 ) {
     static LAST_REPOSITION: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static LAST_MONITOR_CHECK: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-    let is_tray = {
+    let (is_tray, is_taskbar) = {
         let state = lock_state();
-        state
-            .as_ref()
-            .and_then(|s| s.tray_notify_hwnd)
-            .map(|h| h == hwnd)
-            .unwrap_or(false)
+        match state.as_ref() {
+            Some(s) => (
+                s.tray_notify_hwnd.map(|h| h == hwnd).unwrap_or(false),
+                s.taskbar_hwnd.map(|h| h == hwnd).unwrap_or(false),
+            ),
+            None => (false, false),
+        }
     };
+
+    if is_taskbar {
+        // The parent taskbar itself moved — possibly onto another monitor after
+        // a display change. Debounced: auto-hide slides and resizes land here
+        // too, and the mismatch check costs two syscalls.
+        let should_check = {
+            let mut last = LAST_MONITOR_CHECK.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            if last
+                .map(|t| now.duration_since(t).as_millis() > 500)
+                .unwrap_or(true)
+            {
+                *last = Some(now);
+                true
+            } else {
+                false
+            }
+        };
+        if should_check && monitor_pin_mismatch() {
+            let main_hwnd = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.hwnd.to_hwnd())
+            };
+            if let Some(main_hwnd) = main_hwnd {
+                if !ensure_on_pinned_monitor(main_hwnd) {
+                    SetTimer(main_hwnd, TIMER_MONITOR_RECHECK, MONITOR_RECHECK_MS, None);
+                }
+            }
+        }
+    }
 
     if is_tray {
         if tray_reposition_is_suppressed() {
@@ -2488,6 +2603,13 @@ unsafe extern "system" fn wnd_proc(
                 check_language_change();
             }
             refresh_dpi();
+            // A display change can reshuffle which monitor each taskbar serves;
+            // snap back to the pinned one. The shell rearranges asynchronously
+            // after this message, so retry on a short cadence if the pinned
+            // monitor's taskbar isn't reachable yet.
+            if !ensure_on_pinned_monitor(hwnd) {
+                SetTimer(hwnd, TIMER_MONITOR_RECHECK, MONITOR_RECHECK_MS, None);
+            }
             position_at_taskbar();
             render_layered();
             LRESULT(0)
@@ -2536,12 +2658,23 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
+                    // Minute-cadence catch-all: display-change broadcasts go to
+                    // top-level windows and this widget is a taskbar child, so
+                    // drift off the pinned monitor is also corrected here.
+                    if !ensure_on_pinned_monitor(hwnd) {
+                        SetTimer(hwnd, TIMER_MONITOR_RECHECK, MONITOR_RECHECK_MS, None);
+                    }
                     // Taskbars without a TrayNotifyWnd get no tray-location hook,
                     // so this is the only thing that re-anchors the widget when the
                     // clock changes width (9:59 -> 10:00).
                     position_at_taskbar();
                     render_layered();
                     schedule_countdown_timer();
+                }
+                TIMER_MONITOR_RECHECK => {
+                    if ensure_on_pinned_monitor(hwnd) {
+                        let _ = KillTimer(hwnd, TIMER_MONITOR_RECHECK);
+                    }
                 }
                 TIMER_RESET_POLL => {
                     let should_poll = {
@@ -2758,7 +2891,7 @@ unsafe extern "system" fn wnd_proc(
                                 s.tray_offset = new_offset;
                             }
                         }
-                        if attach_to_taskbar(hwnd, target_index) {
+                        if attach_to_taskbar(hwnd, target_index, true) {
                             position_at_taskbar();
                             render_layered();
                         }
