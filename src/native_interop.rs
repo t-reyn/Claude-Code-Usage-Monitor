@@ -214,6 +214,29 @@ pub fn monitor_device_name(hwnd: HWND) -> Option<String> {
     }
 }
 
+/// True when `hwnd` sits on the monitor Windows currently marks primary.
+///
+/// Resolved fresh on every call rather than remembered: `\\.\DISPLAYn` names are
+/// reassigned across reconnects, sleep/wake and driver updates, so a widget that
+/// should live on the primary taskbar cannot pin itself to a name and expect it
+/// to still mean "primary" later.
+pub fn monitor_is_primary(hwnd: HWND) -> bool {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            return false;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return false;
+        }
+        info.dwFlags & MONITORINFOF_PRIMARY != 0
+    }
+}
+
 /// Get the bounding rectangle of a window
 pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
     unsafe {

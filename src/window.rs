@@ -130,6 +130,7 @@ const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
+const IDM_KEEP_ON_PRIMARY: u16 = 32;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_DUTCH: u16 = 42;
@@ -310,6 +311,15 @@ fn settings_path() -> PathBuf {
         .join("ClaudeCodeUsageMonitor")
         .join("settings.json")
 }
+
+/// Sentinel stored in `taskbar_monitor` meaning "whichever display is primary
+/// right now", rather than a fixed `\\.\DISPLAYn` name.
+///
+/// Windows reassigns those names across reconnects, sleep/wake and driver
+/// updates, so a name captured when a display happened to be primary silently
+/// starts pointing at a different physical screen. Not a legal device name, so
+/// it can never collide with a real one.
+const TASKBAR_MONITOR_PRIMARY: &str = "@primary";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SettingsFile {
@@ -526,6 +536,9 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize, update_pin: bool) -> bo
     let index = requested_index.min(taskbars.len().saturating_sub(1));
     let taskbar = taskbars[index];
     let monitor = native_interop::monitor_device_name(taskbar.hwnd);
+    // Resolved here, outside the state lock below: the taskbar's own thread also
+    // takes that lock via the win-event hook, and this is a blocking Win32 call.
+    let attached_to_primary = native_interop::monitor_is_primary(taskbar.hwnd);
     diagnose::log(format!(
         "taskbar selected index={index} count={} hwnd={:?} monitor={monitor:?} rect=({}, {}, {}, {})",
         taskbars.len(),
@@ -579,7 +592,17 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize, update_pin: bool) -> bo
         // Automatic attaches (startup, recovery) keep the existing pin, so an
         // index fallback landing on the wrong monitor stays temporary and
         // self-heals instead of re-pinning the widget to the wrong display.
-        if monitor.is_some() && (update_pin || s.taskbar_monitor.is_none()) {
+        //
+        // A drop onto the display `TASKBAR_MONITOR_PRIMARY` already designates is
+        // not an override: rewriting it to today's device name would silently
+        // downgrade the dynamic pin back into the stale-name pin it replaced, and
+        // untick the menu item the user never touched.
+        let sentinel_still_satisfied =
+            s.taskbar_monitor.as_deref() == Some(TASKBAR_MONITOR_PRIMARY) && attached_to_primary;
+        if monitor.is_some()
+            && !sentinel_still_satisfied
+            && (update_pin || s.taskbar_monitor.is_none())
+        {
             s.taskbar_monitor = monitor;
         }
         s.embedded = true;
@@ -587,9 +610,22 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize, update_pin: bool) -> bo
     true
 }
 
-/// Choose which taskbar to attach to: the one on the saved monitor if it is still
-/// present, otherwise the saved index (clamped). Falls back to the index whenever
-/// the monitor is unknown or gone — e.g. that display was disconnected.
+/// Whether `taskbar_hwnd` satisfies the pin `pinned`.
+///
+/// `pinned` is either a display-device name or [`TASKBAR_MONITOR_PRIMARY`]; the
+/// sentinel is answered from the live primary flag, so it keeps meaning "the
+/// primary screen" even after Windows reshuffles device names.
+fn taskbar_matches_pin(taskbar_hwnd: HWND, pinned: &str) -> bool {
+    if pinned == TASKBAR_MONITOR_PRIMARY {
+        native_interop::monitor_is_primary(taskbar_hwnd)
+    } else {
+        native_interop::monitor_device_name(taskbar_hwnd).as_deref() == Some(pinned)
+    }
+}
+
+/// Choose which taskbar to attach to: the one satisfying the saved pin if it is
+/// still present, otherwise the saved index (clamped). Falls back to the index
+/// whenever the monitor is unknown or gone — e.g. that display was disconnected.
 fn resolve_taskbar_index(saved_monitor: Option<&str>, saved_index: usize) -> usize {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
@@ -598,7 +634,7 @@ fn resolve_taskbar_index(saved_monitor: Option<&str>, saved_index: usize) -> usi
     if let Some(name) = saved_monitor {
         if let Some(index) = taskbars
             .iter()
-            .position(|taskbar| native_interop::monitor_device_name(taskbar.hwnd).as_deref() == Some(name))
+            .position(|taskbar| taskbar_matches_pin(taskbar.hwnd, name))
         {
             return index;
         }
@@ -628,7 +664,7 @@ fn monitor_pin_mismatch() -> bool {
     let (Some(pinned), Some(taskbar_hwnd)) = (pinned, taskbar_hwnd) else {
         return false;
     };
-    native_interop::monitor_device_name(taskbar_hwnd).as_deref() != Some(pinned.as_str())
+    !taskbar_matches_pin(taskbar_hwnd, &pinned)
 }
 
 /// Re-attach to the taskbar on the pinned monitor if the widget has drifted off
@@ -655,10 +691,19 @@ fn ensure_on_pinned_monitor(hwnd: HWND) -> bool {
         return true;
     }
 
-    let target_index = native_interop::find_taskbars().iter().position(|taskbar| {
-        native_interop::monitor_device_name(taskbar.hwnd).as_deref() == Some(pinned.as_str())
-    });
+    let target_index = native_interop::find_taskbars()
+        .iter()
+        .position(|taskbar| taskbar_matches_pin(taskbar.hwnd, &pinned));
     let Some(target_index) = target_index else {
+        if pinned == TASKBAR_MONITOR_PRIMARY {
+            // The primary display is never "absent" — it just has no taskbar of its
+            // own (e.g. "show taskbar on all displays" is off and the single bar was
+            // moved to a secondary). That is a stable configuration, not a transient
+            // one, so retrying every 3s forever would never resolve. Accept where we
+            // are; a later display change or the minute catch-all re-evaluates.
+            diagnose::log("no taskbar on the primary monitor; staying put");
+            return true;
+        }
         // Pinned display currently absent (asleep / detached): keep the pin and
         // stay where we are until it comes back.
         return false;
@@ -2982,6 +3027,54 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     position_at_taskbar();
                 }
+                IDM_KEEP_ON_PRIMARY => {
+                    let (enabling, taskbar_hwnd) = {
+                        let state = lock_state();
+                        match state.as_ref() {
+                            Some(s) => (
+                                s.taskbar_monitor.as_deref() != Some(TASKBAR_MONITOR_PRIMARY),
+                                s.taskbar_hwnd,
+                            ),
+                            None => (false, None),
+                        }
+                    };
+                    // Turning it off freezes the widget to the display it is on right
+                    // now, by name — resolved out here because the win-event hook
+                    // thread also takes the state lock.
+                    let new_pin = if enabling {
+                        Some(TASKBAR_MONITOR_PRIMARY.to_string())
+                    } else {
+                        taskbar_hwnd.and_then(native_interop::monitor_device_name)
+                    };
+                    match new_pin {
+                        Some(pin) => {
+                            {
+                                let mut state = lock_state();
+                                if let Some(s) = state.as_mut() {
+                                    s.taskbar_monitor = Some(pin);
+                                }
+                            }
+                            save_state_settings();
+                            // `ensure_on_pinned_monitor` also returns true when it
+                            // merely DEFERRED (a drag or drop is in flight), so the
+                            // move is confirmed against the pin itself — otherwise
+                            // ticking the item mid-drop would silently do nothing and
+                            // arm no retry, leaving the check-mark asserting a pin
+                            // that never took effect.
+                            if enabling
+                                && (!ensure_on_pinned_monitor(hwnd) || monitor_pin_mismatch())
+                            {
+                                SetTimer(hwnd, TIMER_MONITOR_RECHECK, MONITOR_RECHECK_MS, None);
+                            }
+                        }
+                        // Nothing to name (never embedded). Clearing the pin would hand
+                        // the next attach a blank one to fill in unilaterally, so leave
+                        // it as it is — the toggle is already a visual no-op here.
+                        None => diagnose::log(
+                            "keep-on-primary off: no attached taskbar to name; pin unchanged",
+                        ),
+                    }
+                }
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
                 }
@@ -3124,6 +3217,7 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            keep_on_primary,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -3138,6 +3232,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.taskbar_monitor.as_deref() == Some(TASKBAR_MONITOR_PRIMARY),
                 ),
                 None => (
                     POLL_5_MIN,
@@ -3148,6 +3243,7 @@ fn show_context_menu(hwnd: HWND) {
                     UpdateStatus::Idle,
                     true,
                     true,
+                    false,
                     false,
                     false,
                 ),
@@ -3258,6 +3354,19 @@ fn show_context_menu(hwnd: HWND) {
             startup_flags,
             IDM_START_WITH_WINDOWS as usize,
             PCWSTR::from_raw(startup_str.as_ptr()),
+        );
+
+        let keep_primary_str = native_interop::wide_str(strings.keep_on_primary_monitor);
+        let keep_primary_flags = if keep_on_primary {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            settings_menu,
+            keep_primary_flags,
+            IDM_KEEP_ON_PRIMARY as usize,
+            PCWSTR::from_raw(keep_primary_str.as_ptr()),
         );
 
         let reset_pos_str = native_interop::wide_str(strings.reset_position);

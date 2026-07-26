@@ -17,6 +17,7 @@ pub(super) const STRINGS: Strings = Strings {
     settings: "Configurações",
     start_with_windows: "Iniciar com o Windows",
     reset_position: "Redefinir Posição",
+    keep_on_primary_monitor: "Manter no Monitor Principal",
     language: "Idioma",
     system_default: "Padrão do Sistema",
     check_for_updates: "Busca atualizações",
