@@ -59,6 +59,11 @@ struct AppState {
     session_text: String,
     weekly_percent: f64,
     weekly_text: String,
+    /// Server-provided model name for the scoped weekly limit (e.g. "Fable").
+    /// `None` until a poll has actually reported one — see `refresh_usage_texts`.
+    scoped_weekly_label: Option<String>,
+    scoped_weekly_percent: f64,
+    scoped_weekly_text: String,
     codex_session_percent: f64,
     codex_session_text: String,
     codex_weekly_percent: f64,
@@ -436,12 +441,18 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
                     percent: Some(s.session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().claude_code_model,
-                        s.session_text,
-                        s.weekly_text
-                    ),
+                    tooltip: {
+                        let mut tooltip = format!(
+                            "{} 5h: {} | 7d: {}",
+                            s.language.strings().claude_code_model,
+                            s.session_text,
+                            s.weekly_text
+                        );
+                        if let Some(label) = s.scoped_weekly_label.as_ref() {
+                            tooltip.push_str(&format!(" | {}: {}", label, s.scoped_weekly_text));
+                        }
+                        tooltip
+                    },
                 });
             }
             if s.show_codex {
@@ -1017,9 +1028,20 @@ fn refresh_usage_texts(state: &mut AppState) {
     if let Some(claude_code) = data.claude_code.as_ref() {
         state.session_text = poller::format_line(&claude_code.session, strings);
         state.weekly_text = poller::format_line(&claude_code.weekly, strings);
+        // A poll that fell back to the Messages API cannot report the scoped
+        // limit, so `None` means "unknown", not "gone". Clearing it would make
+        // the third row appear and disappear between polls, shifting the whole
+        // widget's layout.
+        if let Some(scoped) = claude_code.scoped_weekly.as_ref() {
+            state.scoped_weekly_label = Some(scoped.label.clone());
+            state.scoped_weekly_text = poller::format_line(&scoped.section, strings);
+        }
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
+        if state.scoped_weekly_label.is_some() {
+            state.scoped_weekly_text = "!".to_string();
+        }
     }
 
     if let Some(codex) = data.codex.as_ref() {
@@ -1461,7 +1483,63 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
-fn total_widget_width_for(active_models: i32) -> i32 {
+/// The scoped row only exists for Claude, and only once we've actually seen a
+/// scoped limit — the widget is 46px tall, so 3 rows need tighter metrics than 2.
+fn widget_row_count(show_claude_code: bool, has_scoped: bool) -> i32 {
+    if show_claude_code && has_scoped {
+        3
+    } else {
+        2
+    }
+}
+
+/// Per-row drawing values resolved once per paint. `seg_h` and `label_width`
+/// are ALREADY scaled. `segment_count` is resolved by the caller and never
+/// recomputed inside `draw_row`: the scoped row is drawn with only Claude
+/// visible, so a locally derived count would give it 10 segments while rows 1-2
+/// use 5 and the bars would stop lining up.
+///
+/// Kept as one struct rather than four positional arguments on purpose —
+/// `paint_content` is large enough that the extra call arguments overflow LLVM's
+/// x86 instruction selector and crash rustc (STATUS_ACCESS_VIOLATION) in the
+/// release profile.
+struct RowStyle {
+    seg_h: i32,
+    label_width: i32,
+    segment_count: i32,
+    use_model_text_colors: bool,
+}
+
+/// Unscaled (96-DPI base) row geometry; every field must go through `sc()`.
+struct RowMetrics {
+    seg_h: i32,
+    gap: i32,
+    bottom_margin: i32,
+    font_height: i32,
+    label_width: i32,
+}
+
+fn row_metrics(row_count: i32) -> RowMetrics {
+    if row_count >= 3 {
+        RowMetrics {
+            seg_h: 12,
+            gap: 3,
+            bottom_margin: 2,
+            font_height: -10,
+            label_width: 26,
+        }
+    } else {
+        RowMetrics {
+            seg_h: SEGMENT_H,
+            gap: 10,
+            bottom_margin: 5,
+            font_height: -12,
+            label_width: LABEL_WIDTH,
+        }
+    }
+}
+
+fn total_widget_width_for(active_models: i32, row_count: i32) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
     let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
@@ -1469,7 +1547,7 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
+        + sc(row_metrics(row_count).label_width)
         + sc(LABEL_RIGHT_MARGIN)
         + model_width * active_models
         + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
@@ -1477,22 +1555,30 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    ))
+    total_widget_width_for(
+        active_model_count(
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ),
+        widget_row_count(state.show_claude_code, state.scoped_weekly_label.is_some()),
+    )
 }
 
 fn total_widget_width() -> i32 {
-    let active_models = {
+    let (active_models, row_count) = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or(1)
+            .map(|s| {
+                (
+                    active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                    widget_row_count(s.show_claude_code, s.scoped_weekly_label.is_some()),
+                )
+            })
+            .unwrap_or((1, 2))
     };
-    total_widget_width_for(active_models)
+    total_widget_width_for(active_models, row_count)
 }
 
 fn claude_accent_color() -> Color {
@@ -1622,7 +1708,10 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
+            total_widget_width_for(
+                initial_model_count,
+                widget_row_count(settings.show_claude_code, false),
+            ),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -1669,6 +1758,9 @@ pub fn run() {
                 session_text: "--".to_string(),
                 weekly_percent: 0.0,
                 weekly_text: "--".to_string(),
+                scoped_weekly_label: None,
+                scoped_weekly_percent: 0.0,
+                scoped_weekly_text: "--".to_string(),
                 codex_session_percent: 0.0,
                 codex_session_text: "--".to_string(),
                 codex_weekly_percent: 0.0,
@@ -1821,6 +1913,9 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         show_antigravity,
+        scoped_label,
+        scoped_pct,
+        scoped_text,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1844,6 +1939,9 @@ fn render_layered() {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.scoped_weekly_label.clone(),
+                s.scoped_weekly_percent,
+                s.scoped_weekly_text.clone(),
             ),
             None => return,
         }
@@ -1941,6 +2039,9 @@ fn render_layered() {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            scoped_label.as_deref(),
+            scoped_pct,
+            &scoped_text,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -2017,6 +2118,9 @@ fn paint_content(
     show_antigravity: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    scoped_label: Option<&str>,
+    scoped_pct: f64,
+    scoped_text: &str,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -2068,15 +2172,37 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
+        let row_count = widget_row_count(show_claude_code, scoped_label.is_some());
+        let m = row_metrics(row_count);
+        let seg_h = sc(m.seg_h);
+        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+        // Resolved once here so every row — including the Claude-only scoped row —
+        // draws the same number of segments and the bars line up in a column.
+        let style = RowStyle {
+            seg_h,
+            label_width: sc(m.label_width),
+            segment_count: row_bar_segment_count(active_models),
+            use_model_text_colors: active_models > 1,
+        };
+
+        // Rows are anchored to the bottom so the 2-row layout is pixel-identical
+        // to what it was before the scoped row existed, at every DPI.
+        let row_step = sc(m.gap) + seg_h;
+        let last_row_y = height - sc(m.bottom_margin) - seg_h;
+        let row3_y = last_row_y;
+        let row2_y = if row_count >= 3 {
+            row3_y - row_step
+        } else {
+            last_row_y
+        };
+        let row1_y = row2_y - row_step;
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
         let font_name = native_interop::wide_str("Segoe UI");
         let font = CreateFontW(
-            sc(-12),
+            sc(m.font_height),
             0,
             0,
             0,
@@ -2113,6 +2239,7 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            &style,
         );
         draw_row(
             hdc,
@@ -2134,7 +2261,34 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            &style,
         );
+        // The scoped row's label is a proper noun from the API, not a localized
+        // string, and it only ever carries Claude's own sub-limit.
+        if let (3, Some(scoped_label)) = (row_count, scoped_label) {
+            draw_row(
+                hdc,
+                content_x,
+                row3_y,
+                is_dark,
+                text_color,
+                scoped_label,
+                scoped_pct,
+                scoped_text,
+                0.0,
+                "",
+                0.0,
+                "",
+                true,
+                false,
+                false,
+                accent,
+                codex_accent,
+                antigravity_accent,
+                track,
+                &style,
+            );
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -2158,9 +2312,17 @@ fn do_poll(send_hwnd: SendHwnd) {
                 if let Some(claude_code) = data.claude_code.as_ref() {
                     s.session_percent = claude_code.session.percentage;
                     s.weekly_percent = claude_code.weekly.percentage;
+                    // Same rule as the texts: a fallback poll reports no scoped
+                    // limit, so leave the last known value in place.
+                    if let Some(scoped) = claude_code.scoped_weekly.as_ref() {
+                        s.scoped_weekly_percent = scoped.section.percentage;
+                    }
                 } else if s.show_claude_code {
                     s.session_percent = 0.0;
                     s.weekly_percent = 0.0;
+                    if s.scoped_weekly_label.is_some() {
+                        s.scoped_weekly_percent = 0.0;
+                    }
                 }
                 if let Some(codex) = data.codex.as_ref() {
                     s.codex_session_percent = codex.session.percentage;
@@ -2243,6 +2405,9 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.auth_watch_snapshot = watch_snapshot;
                             s.session_text = "!".to_string();
                             s.weekly_text = "!".to_string();
+                            if s.scoped_weekly_label.is_some() {
+                                s.scoped_weekly_text = "!".to_string();
+                            }
                             s.codex_session_text = "!".to_string();
                             s.codex_weekly_text = "!".to_string();
                             s.antigravity_session_text = "!".to_string();
@@ -2746,6 +2911,15 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
             check_language_change();
+            // The scoped row appearing widens the widget, and the widget is
+            // anchored to the tray edge — without re-placing it, it grows
+            // rightward into the clock. Comparing against the live window rect
+            // also self-heals any other width drift.
+            if let Some(rect) = native_interop::get_window_rect_safe(hwnd) {
+                if rect.right - rect.left != total_widget_width() {
+                    position_at_taskbar();
+                }
+            }
             render_layered();
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
@@ -3505,6 +3679,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         show_antigravity,
+        scoped_label,
+        scoped_pct,
+        scoped_text,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -3526,6 +3703,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.scoped_weekly_label.clone(),
+                s.scoped_weekly_percent,
+                s.scoped_weekly_text.clone(),
             ),
             None => return,
         }
@@ -3591,6 +3771,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            scoped_label.as_deref(),
+            scoped_pct,
+            &scoped_text,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3621,11 +3804,14 @@ fn draw_row(
     codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
+    style: &RowStyle,
 ) {
-    let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-    let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1;
+    let RowStyle {
+        seg_h,
+        label_width,
+        segment_count,
+        use_model_text_colors,
+    } = *style;
     let claude_value_color = if use_model_text_colors {
         claude_usage_text_color(is_dark)
     } else {
@@ -3645,20 +3831,23 @@ fn draw_row(
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
         let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+        // 1px of vertical slack: at the 3-row font size a text cell is slightly
+        // taller than the row, and GDI clips DrawTextW to its rect. The vertical
+        // centre is unchanged, so 2-row rendering is unaffected.
         let mut label_rect = RECT {
             left: x,
-            top: y,
-            right: x + sc(LABEL_WIDTH),
-            bottom: y + seg_h,
+            top: y - sc(1),
+            right: x + label_width,
+            bottom: y + seg_h + sc(1),
         };
         let _ = DrawTextW(
             hdc,
             &mut label_wide,
             &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
 
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        let mut model_x = x + label_width + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
             draw_usage_bar(
                 hdc,
@@ -3670,6 +3859,7 @@ fn draw_row(
                 claude_accent,
                 track,
                 &claude_value_color,
+                seg_h,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -3684,6 +3874,7 @@ fn draw_row(
                 codex_accent,
                 track,
                 &codex_value_color,
+                seg_h,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -3698,6 +3889,7 @@ fn draw_row(
                 antigravity_accent,
                 track,
                 &antigravity_value_color,
+                seg_h,
             );
         }
     }
@@ -3719,9 +3911,10 @@ fn draw_usage_bar(
     accent: &Color,
     track: &Color,
     text_color: &Color,
+    // Already scaled.
+    seg_h: i32,
 ) {
     let seg_w = sc(SEGMENT_W);
-    let seg_h = sc(SEGMENT_H);
     let seg_gap = sc(SEGMENT_GAP);
     let corner_r = sc(CORNER_RADIUS);
 
@@ -3778,9 +3971,9 @@ fn draw_usage_bar(
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
             left: text_x,
-            top: y,
+            top: y - sc(1),
             right: text_x + sc(TEXT_WIDTH),
-            bottom: y + seg_h,
+            bottom: y + seg_h + sc(1),
         };
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
         let _ = DrawTextW(

@@ -11,7 +11,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::models::{AppUsageData, ScopedUsage, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -47,12 +47,36 @@ pub type CredentialWatchSnapshot = Vec<String>;
 struct UsageResponse {
     five_hour: Option<UsageBucket>,
     seven_day: Option<UsageBucket>,
+    limits: Option<Vec<UsageLimit>>,
 }
 
 #[derive(Deserialize)]
 struct UsageBucket {
     utilization: f64,
     resets_at: Option<String>,
+}
+
+// `limits[]` is the only place a per-model weekly sub-limit (e.g. a scoped
+// "Fable" weekly cap) shows up — the legacy `seven_day_opus` / `seven_day_sonnet`
+// top-level fields are always null and must not be relied on. Every field here
+// is optional/tolerant since this response gains fields regularly and a hard
+// parse failure would blank the whole widget.
+#[derive(Deserialize)]
+struct UsageLimit {
+    kind: Option<String>,
+    percent: Option<f64>,
+    resets_at: Option<String>,
+    scope: Option<UsageLimitScope>,
+}
+
+#[derive(Deserialize)]
+struct UsageLimitScope {
+    model: Option<UsageLimitModel>,
+}
+
+#[derive(Deserialize)]
+struct UsageLimitModel {
+    display_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -719,7 +743,45 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
     }
 
+    data.scoped_weekly = select_scoped_weekly(response.limits.as_deref().unwrap_or(&[]));
+
     Ok(Some(data))
+}
+
+/// Pick the scoped weekly limit (if any) out of `limits[]`. Only entries with
+/// `kind == "weekly_scoped"` and a non-empty `scope.model.display_name`
+/// qualify; if several qualify, the highest `percent` wins.
+fn select_scoped_weekly(limits: &[UsageLimit]) -> Option<ScopedUsage> {
+    limits
+        .iter()
+        .filter(|limit| limit.kind.as_deref() == Some("weekly_scoped"))
+        .filter_map(|limit| {
+            let label = limit
+                .scope
+                .as_ref()?
+                .model
+                .as_ref()?
+                .display_name
+                .as_deref()?
+                .trim();
+            if label.is_empty() {
+                return None;
+            }
+            let percentage = limit.percent.unwrap_or(0.0);
+            Some(ScopedUsage {
+                label: label.to_string(),
+                section: UsageSection {
+                    percentage,
+                    resets_at: parse_iso8601(limit.resets_at.as_deref()),
+                },
+            })
+        })
+        .max_by(|a, b| {
+            a.section
+                .percentage
+                .partial_cmp(&b.section.percentage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
@@ -909,7 +971,11 @@ fn fetch_antigravity_usage_from_endpoint(
     let session = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
     let weekly = UsageSection::default();
 
-    Ok(UsageData { session, weekly })
+    Ok(UsageData {
+        session,
+        weekly,
+        scoped_weekly: None,
+    })
 }
 
 fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
@@ -1620,6 +1686,7 @@ mod tests {
                 resets_at: None,
             },
             weekly: UsageSection::default(),
+            scoped_weekly: None,
         }
     }
 
@@ -1740,5 +1807,75 @@ mod tests {
         assert!((usage.session.percentage - 4.17425).abs() < 0.000001);
         assert!(usage.weekly.resets_at.is_some());
         assert!(usage.session.resets_at.is_some());
+    }
+
+    #[test]
+    fn usage_response_selects_highest_percent_scoped_weekly_limit() {
+        let response: UsageResponse = serde_json::from_str(
+            r#"{"five_hour":{"utilization":11.0,"resets_at":"2026-08-06T09:09:59.444649+00:00","limit_dollars":null},
+ "seven_day":{"utilization":77.0,"resets_at":"2026-08-08T12:59:59.444670+00:00","limit_dollars":null},
+ "seven_day_opus":null,"seven_day_sonnet":null,"seven_day_cowork":null,
+ "limits":[
+   {"kind":"session","group":"session","percent":11,"severity":"normal","resets_at":"2026-08-06T09:09:59.444649+00:00","scope":null,"is_active":false},
+   {"kind":"weekly_all","group":"weekly","percent":77,"severity":"warning","resets_at":"2026-08-08T12:59:59.444670+00:00","scope":null,"is_active":false},
+   {"kind":"weekly_scoped","group":"weekly","percent":87,"severity":"warning","resets_at":"2026-08-08T12:59:59.444855+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":true}
+ ],
+ "extra_usage":{"is_enabled":false},"member_dashboard_available":false}"#,
+        )
+        .expect("full usage payload should deserialize");
+
+        assert_eq!(response.seven_day.as_ref().unwrap().utilization, 77.0);
+
+        let scoped = select_scoped_weekly(response.limits.as_deref().unwrap_or(&[]))
+            .expect("weekly_scoped limit with a model label should be selected");
+
+        assert_eq!(scoped.label, "Fable");
+        assert_eq!(scoped.section.percentage, 87.0);
+        assert!(scoped.section.resets_at.is_some());
+    }
+
+    // The winner sits in the middle of the array on purpose: a "take the first"
+    // or "take the last" implementation has to fail this, not just a min/max mixup.
+    #[test]
+    fn select_scoped_weekly_picks_the_highest_of_several_scoped_limits() {
+        let response: UsageResponse = serde_json::from_str(
+            r#"{"limits":[
+                {"kind":"weekly_scoped","percent":42,"resets_at":"2026-08-08T12:59:59Z","scope":{"model":{"id":null,"display_name":"Sonnet"}}},
+                {"kind":"weekly_scoped","percent":87,"resets_at":"2026-08-08T12:59:59Z","scope":{"model":{"id":null,"display_name":"Fable"}}},
+                {"kind":"weekly_scoped","percent":60,"resets_at":"2026-08-08T12:59:59Z","scope":{"model":{"id":null,"display_name":"Haiku"}}}
+            ]}"#,
+        )
+        .expect("payload should deserialize");
+
+        let scoped = select_scoped_weekly(response.limits.as_deref().unwrap_or(&[]))
+            .expect("a scoped limit should be selected");
+
+        assert_eq!(scoped.label, "Fable");
+        assert_eq!(scoped.section.percentage, 87.0);
+    }
+
+    #[test]
+    fn select_scoped_weekly_returns_none_when_limits_is_empty_or_missing() {
+        assert!(select_scoped_weekly(&[]).is_none());
+
+        let response: UsageResponse = serde_json::from_str(r#"{"limits":[]}"#)
+            .expect("empty limits array should deserialize");
+        assert!(select_scoped_weekly(response.limits.as_deref().unwrap_or(&[])).is_none());
+
+        let response: UsageResponse =
+            serde_json::from_str(r#"{}"#).expect("missing limits key should deserialize");
+        assert!(select_scoped_weekly(response.limits.as_deref().unwrap_or(&[])).is_none());
+    }
+
+    #[test]
+    fn select_scoped_weekly_ignores_entry_with_null_scope() {
+        let response: UsageResponse = serde_json::from_str(
+            r#"{"limits":[
+                {"kind":"weekly_scoped","percent":87,"resets_at":"2026-08-08T12:59:59Z","scope":null}
+            ]}"#,
+        )
+        .expect("payload should deserialize");
+
+        assert!(select_scoped_weekly(response.limits.as_deref().unwrap_or(&[])).is_none());
     }
 }
