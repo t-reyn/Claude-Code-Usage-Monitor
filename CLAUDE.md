@@ -5,6 +5,12 @@ Personal aesthetic fork of [CodeZeno/Claude-Code-Usage-Monitor](https://github.c
 - Remotes: `origin` = t-reyn fork, `upstream` = CodeZeno. Work happens on `custom-theme`; keep `main` clean for upstream syncs.
 - No upstream PRs intended. No tests — verify by building and running.
 
+## Memory
+
+Project memory for this repo lives in the claude-sync repo and is imported below. It loads only when a session works in this project. When a fact about this project changes, update that file in place (Status, Open items, Key decisions). Dated history goes in the ARCHIVE.md or dated project file beside it, never the workspace MEMORY.md. Cross-project rules stay in the root `claude-sync/memory/MEMORY.md`.
+
+@../claude-sync/memory/Claude-Code-Usage-Monitor/MEMORY.md
+
 ## Build & run
 
 ```powershell
